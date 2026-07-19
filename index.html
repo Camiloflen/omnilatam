@@ -2717,6 +2717,16 @@ window.OmniStore = {
     });
   });
 
+  // Sin App ID configurado, el botón de Facebook se oculta (en vez de mostrar
+  // un error a los visitantes); reaparece solo al pegar el App ID en OAUTH.
+  if (!OAUTH.facebookAppId) {
+    document.querySelectorAll('[data-oauth="facebook"]').forEach(function (btn) {
+      btn.style.display = "none";
+      var row = btn.closest(".oauth-row");
+      if (row) row.style.gridTemplateColumns = "1fr";
+    });
+  }
+
   // Clicking the logo/wordmark always takes you back to the home page.
   var headerBrand = document.getElementById("header-brand");
   headerBrand.addEventListener("click", function () {
