@@ -2295,9 +2295,9 @@ window.OmniDB = window.supabase
             <span class="check-box"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.5"><path d="M4 12l5 5L20 6"/></svg></span>
             <div><b>Tarjeta guardada</b><span class="sub">Visa terminada en 4821 · 3 cuotas sin interés</span></div>
           </div>
-          <div class="pay-chip" data-pay="Webpay (simulado)">
+          <div class="pay-chip" data-pay="Webpay">
             <span class="check-box"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.5"><path d="M4 12l5 5L20 6"/></svg></span>
-            <div><b>Webpay</b><span class="sub">Débito o crédito de cualquier banco (simulado)</span></div>
+            <div><b>Webpay</b><span class="sub">Débito o crédito de cualquier banco</span></div>
           </div>
           <div class="pay-chip" data-pay="Transferencia bancaria">
             <span class="check-box"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.5"><path d="M4 12l5 5L20 6"/></svg></span>
@@ -3595,12 +3595,13 @@ window.OmniStore = {
   });
 
   var gradientIndex = 0;
-  function addToCart(name, price, qty) {
+  function addToCart(name, price, qty, productId) {
     var existing = cart.find(function (i) { return i.name === name; });
     if (existing) {
       existing.qty += qty;
+      if (productId) existing.pid = productId;
     } else {
-      cart.push({ name: name, price: price, qty: qty, thumb: gradients[gradientIndex % gradients.length] });
+      cart.push({ name: name, price: price, qty: qty, pid: productId || null, thumb: gradients[gradientIndex % gradients.length] });
       gradientIndex++;
     }
     renderCart();
@@ -4122,9 +4123,116 @@ window.OmniStore = {
     if (comprasList) comprasList.prepend(buildOrderRow(order));
   });
 
+  // El retorno de Webpay (script aparte) registra aquí la compra aprobada:
+  // misma contabilidad local que un pedido simulado (Compras + boleta + carrito).
+  window.OmniOrders = {
+    recordPaid: function (ctx) {
+      var distinct = ctx.items.length;
+      var title = ctx.items[0].name + (distinct > 1 ? " y " + (distinct - 1) + " más" : "");
+      var dateLabel = new Date().toLocaleDateString("es-CL", { day: "2-digit", month: "short", year: "numeric" }).replace(/\./g, "");
+      var order = {
+        title: title,
+        sub: dateLabel + " · " + formatCLP(ctx.total) + " · Webpay",
+        status: "En preparación",
+        thumbStyle: "background: var(--surface-alt);",
+        itemNames: ctx.items.map(function (i) { return i.name; }),
+        ts: Date.now(),
+        items: ctx.items,
+        addressText: ctx.addressText,
+        pay: "Webpay",
+        subtotal: ctx.subtotal,
+        shipping: ctx.shipping,
+        total: ctx.total
+      };
+      savedOrders.push(order);
+      OmniStore.write({ orders: savedOrders });
+      if (comprasList) comprasList.prepend(buildOrderRow(order));
+      if (window.OmniInvoices) {
+        OmniInvoices.add({
+          number: "B-" + new Date().getFullYear() + "-" + Math.floor(10000 + Math.random() * 90000),
+          date: dateLabel,
+          total: formatCLP(ctx.total),
+          title: title,
+          pay: "Webpay",
+          buyer: ctx.buyer || "—"
+        });
+      }
+      if (window.OmniCart) OmniCart.clear();
+    }
+  };
+
+  // Con Webpay el pago es real: la orden se crea en Supabase y el navegador
+  // viaja al formulario de Transbank; el resto de los métodos siguen simulados.
+  async function confirmWithWebpay(t) {
+    var btn = document.getElementById("ck-confirm");
+    btn.disabled = true;
+    btn.textContent = "Conectando con Webpay...";
+    function fail(msg) {
+      btn.disabled = false;
+      btn.textContent = "Confirmar pedido";
+      alert(msg);
+    }
+    try {
+      var sessionRes = await OmniDB.auth.getSession();
+      var session = sessionRes.data ? sessionRes.data.session : null;
+      if (!session) return fail("Inicia sesión para pagar con Webpay.");
+      var items = t.cart.filter(function (i) { return i.pid; });
+      if (!items.length) return fail("Los productos del carrito ya no están disponibles. Vacíalo y agrégalos de nuevo.");
+      // Datos reales del producto (precio y tienda) directo de la base
+      var ids = items.map(function (i) { return i.pid; });
+      var prodRes = await OmniDB.from("products").select("id, store_id, price_clp, stock").in("id", ids);
+      if (prodRes.error) return fail("Error leyendo los productos: " + prodRes.error.message);
+      var byId = {};
+      prodRes.data.forEach(function (p) { byId[p.id] = p; });
+      var total = 0;
+      for (var k = 0; k < items.length; k++) {
+        var p = byId[items[k].pid];
+        if (!p) return fail('"' + items[k].name + '" ya no está publicado. Quítalo del carrito.');
+        if (p.stock < items[k].qty) return fail('Stock insuficiente de "' + items[k].name + '" (quedan ' + p.stock + ").");
+        total += p.price_clp * items[k].qty;
+      }
+      total += t.shipping || 0;
+      // 1) Orden + items
+      var orderRes = await OmniDB.from("orders").insert({ buyer_id: session.user.id, total_clp: total }).select("id").single();
+      if (orderRes.error) return fail("No se pudo crear el pedido: " + orderRes.error.message);
+      var orderId = orderRes.data.id;
+      var itemsRes = await OmniDB.from("order_items").insert(items.map(function (i) {
+        return { order_id: orderId, product_id: i.pid, store_id: byId[i.pid].store_id, quantity: i.qty, unit_price_clp: byId[i.pid].price_clp };
+      }));
+      if (itemsRes.error) return fail("No se pudo registrar el detalle: " + itemsRes.error.message);
+      // 2) Transacción Webpay (la función corre en Supabase)
+      var fn = await fetch("https://jhkprffhyihuoxuyuxps.supabase.co/functions/v1/webpay-create", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + session.access_token,
+          "apikey": "sb_publishable_CYle2DG8AXkWTYnOY9nChw_ALA1iWBt"
+        },
+        body: JSON.stringify({ kind: "order", referenceId: orderId, returnTo: "web" })
+      });
+      var pay = await fn.json();
+      if (!fn.ok || !pay.redirectUrl) return fail("Webpay no respondió: " + (pay.error || fn.status));
+      // 3) Guardamos el contexto para retomar al volver del pago
+      OmniStore.write({ pendingCheckout: {
+        orderId: orderId,
+        total: total,
+        subtotal: t.subtotal,
+        shipping: t.shipping,
+        items: t.cart.map(function (i) { return { name: i.name, qty: i.qty, price: i.price }; }),
+        addressText: address.name + " · " + address.street + ", " + address.comuna + ", " + address.region,
+        buyer: address.name,
+        comuna: address.comuna
+      }});
+      window.location.href = pay.redirectUrl;
+    } catch (err) {
+      fail("Error inesperado: " + (err && err.message ? err.message : err));
+    }
+  }
+
   document.getElementById("ck-confirm").addEventListener("click", function () {
     var t = cartTotals();
     if (t.cart.length === 0) { closeModal(); return; }
+    if (payMethod === "Webpay" && window.OmniDB) { confirmWithWebpay(t); return; }
     var distinct = t.cart.length;
     var title = t.cart[0].name + (distinct > 1 ? " y " + (distinct - 1) + " más" : "");
     var dateLabel = new Date().toLocaleDateString("es-CL", { day: "2-digit", month: "short", year: "numeric" }).replace(/\./g, "");
@@ -4268,7 +4376,7 @@ window.OmniStore = {
     var name = card.querySelector("h3").textContent.trim();
     var stock = Number(card.dataset.stock) || 0;
     var sellerName = card.querySelector(".seller").textContent.trim().split("·")[0].trim();
-    current = { name: name, price: Number(card.dataset.price) || 0, stock: stock, seller: sellerName };
+    current = { name: name, price: Number(card.dataset.price) || 0, stock: stock, seller: sellerName, productId: card.dataset.productId || null };
     qty = 1;
     qtyValue.textContent = "1";
 
@@ -4341,7 +4449,7 @@ window.OmniStore = {
 
   addCartBtn.addEventListener("click", function () {
     if (!current || !window.OmniCart) return;
-    OmniCart.add(current.name, current.price, qty);
+    OmniCart.add(current.name, current.price, qty, current.productId);
     var original = "Agregar al carrito";
     addCartBtn.textContent = "Agregado ✓";
     setTimeout(function () { addCartBtn.textContent = original; }, 1100);
@@ -4367,7 +4475,7 @@ window.OmniStore = {
       if (loginBtn) loginBtn.click();
       return;
     }
-    OmniCart.add(current.name, current.price, qty);
+    OmniCart.add(current.name, current.price, qty, current.productId);
     closeProductPage();
     var cartPage = document.getElementById("carrito");
     if (cartPage) {
@@ -4941,7 +5049,7 @@ window.OmniStore = {
     if (btn.classList.contains("card-details-btn") && window.OmniProduct) {
       OmniProduct.open(card);
     } else if (btn.classList.contains("card-cart-btn") && !btn.disabled && window.OmniCart) {
-      OmniCart.add(card.querySelector("h3").textContent.trim(), Number(card.dataset.price) || 0, 1);
+      OmniCart.add(card.querySelector("h3").textContent.trim(), Number(card.dataset.price) || 0, 1, card.dataset.productId);
       var t = btn.textContent;
       btn.textContent = "Agregado ✓";
       setTimeout(function () { btn.textContent = t; }, 1100);
@@ -4950,6 +5058,59 @@ window.OmniStore = {
 
   window.OmniCatalogo = { reload: loadProducts };
   loadCategories().then(loadProducts);
+})();
+</script>
+
+<script>
+(function () {
+  // ---- Retorno de Webpay ----
+  // Transbank devuelve al comprador con ?token_ws=...; aquí confirmamos el pago
+  // contra la función webpay-confirm y cerramos la compra.
+  if (!window.OmniDB) return;
+  var params = new URLSearchParams(window.location.search);
+  if (!params.has("token_ws")) return;
+  var token = params.get("token_ws") || "";
+  history.replaceState(null, "", window.location.pathname);
+  var ctx = OmniStore.read().pendingCheckout;
+
+  function toast(msg) {
+    var t = document.getElementById("toast-success");
+    if (!t) { alert(msg); return; }
+    var span = t.querySelector("span:last-child");
+    var prev = span.textContent;
+    span.textContent = msg;
+    t.classList.add("show");
+    setTimeout(function () { t.classList.remove("show"); span.textContent = prev; }, 5000);
+  }
+
+  if (!token) {
+    OmniStore.write({ pendingCheckout: null });
+    toast("Pago cancelado. Tu carrito sigue intacto.");
+    return;
+  }
+
+  (async function () {
+    var sessionRes = await OmniDB.auth.getSession();
+    var session = sessionRes.data ? sessionRes.data.session : null;
+    if (!session) { toast("Vuelve a iniciar sesión para confirmar tu pago."); return; }
+    var fn = await fetch("https://jhkprffhyihuoxuyuxps.supabase.co/functions/v1/webpay-confirm", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + session.access_token,
+        "apikey": "sb_publishable_CYle2DG8AXkWTYnOY9nChw_ALA1iWBt"
+      },
+      body: JSON.stringify({ token: token })
+    });
+    var out = await fn.json().catch(function () { return {}; });
+    OmniStore.write({ pendingCheckout: null });
+    if (fn.ok && out.approved) {
+      if (ctx && window.OmniOrders) OmniOrders.recordPaid(ctx);
+      toast("¡Pago aprobado! Tu pedido quedó registrado en Compras.");
+    } else {
+      toast("El pago no fue aprobado. Puedes intentarlo de nuevo desde tu carrito.");
+    }
+  })();
 })();
 </script>
 
