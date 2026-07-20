@@ -311,6 +311,10 @@ window.OmniDB = window.supabase
 
   /* Catalog */
   .grid-cards { display: grid; grid-template-columns: 1fr; gap: 20px; }
+  .card-photo {
+    height: 150px; border-radius: 10px; margin-bottom: 4px;
+    background-color: var(--surface-alt); background-position: center; background-size: cover; background-repeat: no-repeat;
+  }
   @media (min-width: 620px) { .grid-cards { grid-template-columns: repeat(2, 1fr); } }
   @media (min-width: 960px) { .grid-cards { grid-template-columns: repeat(3, 1fr); } }
   .card {
@@ -1908,19 +1912,24 @@ window.OmniDB = window.supabase
 
         <form id="listing-form" onsubmit="return false;">
           <label>Nombre de la publicación
-            <input type="text" placeholder="Ej: Bicicleta urbana aro 700" required>
+            <input type="text" id="listing-title" placeholder="Ej: Bicicleta urbana aro 700" required>
           </label>
           <label>Descripción
-            <textarea rows="3" placeholder="Describe el estado, características y detalles importantes." required></textarea>
+            <textarea rows="3" id="listing-desc" placeholder="Describe el estado, características y detalles importantes." required></textarea>
+          </label>
+          <label>Categoría
+            <select id="listing-category" required>
+              <option value="">Elige una categoría...</option>
+            </select>
           </label>
           <label>Precio
             <span class="price-input-wrap">
               <span>$</span>
-              <input type="text" inputmode="numeric" placeholder="0" required>
+              <input type="text" id="listing-price" inputmode="numeric" placeholder="0" required>
             </span>
           </label>
           <label>Stock disponible
-            <input type="number" min="0" inputmode="numeric" placeholder="Ej: 10" required>
+            <input type="number" id="listing-stock" min="0" inputmode="numeric" placeholder="Ej: 10" required>
           </label>
           <label><span id="delivery-question">¿Cómo entregas tu producto o servicio?</span>
             <div class="delivery-row">
@@ -3053,6 +3062,15 @@ window.OmniStore = {
   searchInput.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); render(); } });
 
   render();
+
+  // El catálogo real (Supabase) reemplaza las tarjetas después de cargar:
+  // este hook le permite refrescar la lista interna y re-aplicar los filtros.
+  window.OmniCatalogFilter = {
+    refresh: function () {
+      cards = Array.prototype.slice.call(grid.querySelectorAll(".card"));
+      render();
+    }
+  };
 })();
 </script>
 
@@ -3152,12 +3170,82 @@ window.OmniStore = {
     chip.addEventListener("click", function () { chip.classList.toggle("sel"); });
   });
 
-  form.addEventListener("submit", function (e) {
+  // Publicación real: tienda + producto + foto quedan en Supabase.
+  form.addEventListener("submit", async function (e) {
     e.preventDefault();
-    closeModal();
-    form.reset();
-    preview.classList.remove("show");
-    dropzone.style.display = "block";
+    if (!window.OmniDB) { alert("Sin conexión con el servidor. Revisa tu internet y recarga la página."); return; }
+    var sessionRes = await OmniDB.auth.getSession();
+    var session = sessionRes.data ? sessionRes.data.session : null;
+    if (!session) {
+      closeModal();
+      var loginBtn = document.getElementById("login-toggle");
+      if (loginBtn) loginBtn.click();
+      return;
+    }
+    var title = document.getElementById("listing-title").value.trim();
+    var desc = document.getElementById("listing-desc").value.trim();
+    var catId = document.getElementById("listing-category").value;
+    var price = parseInt(document.getElementById("listing-price").value.replace(/\D/g, ""), 10) || 0;
+    var stock = parseInt(document.getElementById("listing-stock").value, 10) || 0;
+    if (!title || !catId || price <= 0) { alert("Completa el nombre, la categoría y un precio mayor a 0."); return; }
+
+    var submitBtn = form.querySelector('button[type="submit"]');
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Publicando...";
+    function done(msg) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Publicar";
+      if (msg) alert(msg);
+    }
+    try {
+      // 1) La tienda del vendedor (se crea sola la primera vez que publica)
+      var uid = session.user.id;
+      var storeRes = await OmniDB.from("stores").select("id").eq("owner_id", uid).limit(1);
+      if (storeRes.error) return done("Error leyendo tu tienda: " + storeRes.error.message);
+      var storeId = storeRes.data && storeRes.data[0] ? storeRes.data[0].id : null;
+      if (!storeId) {
+        var meta = session.user.user_metadata || {};
+        var ownerName = meta.full_name || session.user.email.split("@")[0];
+        var newStore = await OmniDB.from("stores").insert({ owner_id: uid, name: "Tienda de " + ownerName }).select("id").single();
+        if (newStore.error) return done("No se pudo crear tu tienda: " + newStore.error.message);
+        storeId = newStore.data.id;
+      }
+      // 2) El producto, activo de inmediato
+      var prodRes = await OmniDB.from("products").insert({
+        store_id: storeId, category_id: catId, title: title, description: desc,
+        price_clp: price, stock: stock, status: "active"
+      }).select("id").single();
+      if (prodRes.error) return done("No se pudo publicar: " + prodRes.error.message);
+      // 3) La foto (opcional) a Supabase Storage
+      var file = photoInput.files && photoInput.files[0];
+      if (file) {
+        var ext = (file.name.split(".").pop() || "jpg").toLowerCase();
+        var path = uid + "/" + prodRes.data.id + "." + ext;
+        var up = await OmniDB.storage.from("product-images").upload(path, file, { upsert: true });
+        if (up.error) {
+          done("El producto se publicó, pero la foto no se pudo subir: " + up.error.message);
+        } else {
+          var pub = OmniDB.storage.from("product-images").getPublicUrl(path);
+          await OmniDB.from("product_images").insert({ product_id: prodRes.data.id, url: pub.data.publicUrl, sort_order: 0 });
+        }
+      }
+      done();
+      closeModal();
+      form.reset();
+      preview.classList.remove("show");
+      dropzone.style.display = "block";
+      if (window.OmniCatalogo) OmniCatalogo.reload();
+      var toast = document.getElementById("toast-success");
+      if (toast) {
+        var toastText = toast.querySelector("span:last-child");
+        var prevText = toastText.textContent;
+        toastText.textContent = "¡Publicación creada!";
+        toast.classList.add("show");
+        setTimeout(function () { toast.classList.remove("show"); toastText.textContent = prevText; }, 3000);
+      }
+    } catch (err) {
+      done("Error inesperado: " + (err && err.message ? err.message : err));
+    }
   });
 })();
 </script>
@@ -4186,7 +4274,12 @@ window.OmniStore = {
 
     var allCards = Array.prototype.slice.call(document.querySelectorAll("#cat-grid .card"));
     var idx = allCards.indexOf(card);
-    document.getElementById("product-gallery").style.background = galleryGradients[(idx < 0 ? 0 : idx) % galleryGradients.length];
+    var gallery = document.getElementById("product-gallery");
+    if (card.dataset.image) {
+      gallery.style.background = "url('" + card.dataset.image + "') center/cover no-repeat";
+    } else {
+      gallery.style.background = galleryGradients[(idx < 0 ? 0 : idx) % galleryGradients.length];
+    }
     document.getElementById("product-type-badge").textContent = card.dataset.type + " · " + card.dataset.cat;
     document.getElementById("product-cat-line").textContent = card.querySelector(".cat-tag").textContent;
     document.getElementById("product-title").textContent = name;
@@ -4201,7 +4294,7 @@ window.OmniStore = {
     document.getElementById("product-seller-box").innerHTML = card.querySelector(".seller").innerHTML;
 
     var copy = productCopy[name] || {
-      desc: "Publicación en OmniLatam de la categoría " + card.dataset.cat + ". Contacta al vendedor para más detalles.",
+      desc: card.dataset.desc || ("Publicación en OmniLatam de la categoría " + card.dataset.cat + ". Contacta al vendedor para más detalles."),
       features: ["Vendedor con reputación en la plataforma", "Pago protegido por OmniLatam"]
     };
     document.getElementById("product-desc-text").textContent = copy.desc;
@@ -4230,6 +4323,9 @@ window.OmniStore = {
     document.body.style.overflow = "hidden";
     page.scrollTop = 0;
   }
+
+  // El catálogo real crea tarjetas dinámicas y necesita abrir esta subpágina.
+  window.OmniProduct = { open: openProductPage };
 
   document.getElementById("product-page-close").addEventListener("click", closeProductPage);
   document.addEventListener("keydown", function (e) {
@@ -4760,6 +4856,100 @@ window.OmniStore = {
   renderStatus();
   renderGrid();
   renderHistory();
+})();
+</script>
+
+<script>
+(function () {
+  // ---- Catálogo real desde Supabase ----
+  // Reemplaza las tarjetas demo por los productos publicados por los vendedores.
+  var grid = document.getElementById("cat-grid");
+  if (!grid || !window.OmniDB) return;
+  var catRow = document.getElementById("cat-filter-categories");
+  var emptyEl = document.getElementById("cat-empty");
+
+  function clp(n) { return "$" + String(n).replace(/\B(?=(\d{3})+(?!\d))/g, "."); }
+  function esc(s) {
+    var d = document.createElement("div");
+    d.textContent = s == null ? "" : String(s);
+    return d.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  async function loadCategories() {
+    var res = await OmniDB.from("categories").select("id,name").order("name");
+    if (res.error || !res.data || !res.data.length) return;
+    var chips = '<span class="filter-chip sel" data-cat="todas">Todas</span>';
+    res.data.forEach(function (c) {
+      chips += '<span class="filter-chip" data-cat="' + esc(c.name) + '">' + esc(c.name) + "</span>";
+    });
+    catRow.innerHTML = chips;
+    var sel = document.getElementById("listing-category");
+    if (sel) {
+      var opts = '<option value="">Elige una categoría...</option>';
+      res.data.forEach(function (c) { opts += '<option value="' + c.id + '">' + esc(c.name) + "</option>"; });
+      sel.innerHTML = opts;
+    }
+  }
+
+  function cardHTML(p) {
+    var catName = p.categories ? p.categories.name : "General";
+    var storeName = p.stores ? p.stores.name : "Vendedor OmniLatam";
+    var imgs = (p.product_images || []).slice().sort(function (a, b) { return a.sort_order - b.sort_order; });
+    var img = imgs.length ? imgs[0].url : "";
+    var stockTxt = p.stock === 0 ? "Sin stock" : (p.stock === 1 ? "1 disponible" : p.stock + " disponibles");
+    var rating = p.rating_count > 0
+      ? " · " + Number(p.rating_avg).toFixed(1) + " ★ (" + p.rating_count + ")"
+      : " · Nuevo";
+    var searchIdx = (p.title + " " + storeName + " " + catName).toLowerCase();
+    return '<article class="card" data-product-id="' + p.id + '"' +
+      ' data-cat="' + esc(catName) + '" data-type="Físico" data-price="' + p.price_clp + '"' +
+      ' data-verified="true" data-rating="' + (p.rating_avg || 0) + '" data-stock="' + p.stock + '"' +
+      ' data-search="' + esc(searchIdx) + '" data-desc="' + esc(p.description || "") + '"' +
+      (img ? ' data-image="' + esc(img) + '"' : "") + ">" +
+      (img ? '<div class="card-photo" style="background-image:url(&quot;' + esc(img) + '&quot;)"></div>' : "") +
+      '<span class="cat-tag">' + esc(catName) + "</span>" +
+      "<h3>" + esc(p.title) + "</h3>" +
+      '<div class="seller">' + esc(storeName) + rating + "</div>" +
+      '<div class="card-stock">' + stockTxt + "</div>" +
+      '<div class="card-bottom"><span class="price">' + clp(p.price_clp) + "</span><small></small></div>" +
+      '<div class="card-actions">' +
+        '<button class="btn btn-outline card-details-btn" type="button">Ver detalles</button>' +
+        '<button class="btn btn-primary card-cart-btn" type="button"' + (p.stock === 0 ? " disabled" : "") + ">" +
+          (p.stock === 0 ? "Agotado" : "Agregar al carrito") + "</button>" +
+      "</div></article>";
+  }
+
+  async function loadProducts() {
+    var res = await OmniDB.from("products")
+      .select("id,title,description,price_clp,stock,status,rating_avg,rating_count,categories(name),stores(name),product_images(url,sort_order)")
+      .eq("status", "active")
+      .order("created_at", { ascending: false });
+    if (res.error) return; // si el servidor falla, se conserva lo que haya en pantalla
+    grid.innerHTML = res.data.map(cardHTML).join("");
+    if (res.data.length === 0 && emptyEl) {
+      emptyEl.innerHTML = "Aún no hay productos publicados. <b>¡Sé el primero en vender en OmniLatam!</b>";
+    }
+    if (window.OmniCatalogFilter) OmniCatalogFilter.refresh();
+  }
+
+  // Las tarjetas reales se crean dinámicamente: sus botones se manejan por delegación.
+  grid.addEventListener("click", function (e) {
+    var card = e.target.closest(".card");
+    if (!card || !card.dataset.productId) return;
+    var btn = e.target.closest("button");
+    if (!btn) return;
+    if (btn.classList.contains("card-details-btn") && window.OmniProduct) {
+      OmniProduct.open(card);
+    } else if (btn.classList.contains("card-cart-btn") && !btn.disabled && window.OmniCart) {
+      OmniCart.add(card.querySelector("h3").textContent.trim(), Number(card.dataset.price) || 0, 1);
+      var t = btn.textContent;
+      btn.textContent = "Agregado ✓";
+      setTimeout(function () { btn.textContent = t; }, 1100);
+    }
+  });
+
+  window.OmniCatalogo = { reload: loadProducts };
+  loadCategories().then(loadProducts);
 })();
 </script>
 
